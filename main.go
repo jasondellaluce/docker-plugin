@@ -34,38 +34,50 @@ import (
 	docker "github.com/moby/docker/client"
 )
 
+const (
+	PluginID          uint32 = 5
+	PluginName               = "docker"
+	PluginDescription        = "Docker Events"
+	PluginContact            = "github.com/falcosecurity/plugins/"
+	PluginVersion            = "0.2.0"
+	PluginEventSource        = "docker"
+)
+
 // DockerPlugin represents our plugin
 type DockerPlugin struct {
 	plugins.BasePlugin
 	FlushInterval uint64 `json:"flushInterval" jsonschema:"description=Flush Interval in ms (Default: 30)"`
+	ctx           context.Context
+	msgC          <-chan dockerEvents.Message
+	errC          <-chan error
 }
 
 // DockerInstance represents a opened stream based on our Plugin
 type DockerInstance struct {
 	source.BaseInstance
-	dclient *docker.Client
-	msgC    <-chan dockerEvents.Message
-	errC    <-chan error
-	ctx     context.Context
 }
 
 // init function is used for referencing our plugin to the Falco plugin framework
 func init() {
-	p := &DockerPlugin{}
-	extractor.Register(p)
-	source.Register(p)
+	plugins.SetFactory(func() plugins.Plugin {
+		p := &DockerPlugin{
+			ctx: context.Background(),
+		}
+		source.Register(p)
+		extractor.Register(p)
+		return p
+	})
 }
 
 // Info displays information of the plugin to Falco plugin framework
 func (dockerPlugin *DockerPlugin) Info() *plugins.Info {
 	return &plugins.Info{
-		ID:                 5,
-		Name:               "docker",
-		Description:        "Docker Events",
-		Contact:            "github.com/falcosecurity/plugins/",
-		Version:            "0.1.0",
-		RequiredAPIVersion: "0.3.0",
-		EventSource:        "docker",
+		ID:          PluginID,
+		Name:        PluginName,
+		Description: PluginDescription,
+		Contact:     PluginContact,
+		Version:     PluginVersion,
+		EventSource: PluginEventSource,
 	}
 }
 
@@ -171,15 +183,27 @@ func (dockerPlugin *DockerPlugin) Open(params string) (source.Instance, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	ctx := context.Background()
-	msgC, errC := dclient.Events(ctx, dockerTypes.EventsOptions{})
-	return &DockerInstance{
-		dclient: dclient,
-		msgC:    msgC,
-		errC:    errC,
-		ctx:     ctx,
-	}, nil
+	dockerPlugin.msgC, dockerPlugin.errC = dclient.Events(ctx, dockerTypes.EventsOptions{})
+
+	pull := func(ctx context.Context, evt sdk.EventWriter) error {
+		select {
+		case m := <-dockerPlugin.msgC:
+			s, _ := json.Marshal(m)
+			if _, err := evt.Writer().Write(s); err != nil {
+				return err
+			}
+		case err := <-dockerPlugin.errC:
+			// todo: this will cause the program to exit. May we want to ignore some kind of error?
+			return err
+		}
+		return nil
+	}
+	return source.NewPullInstance(
+		pull,
+		source.WithInstanceClose(func() { dockerPlugin.ctx.Done() }),
+		source.WithInstanceTimeout(time.Duration(dockerPlugin.FlushInterval)*time.Millisecond),
+	)
 }
 
 // String represents the raw value of on event
@@ -192,39 +216,6 @@ func (dockerPlugin *DockerPlugin) String(in io.ReadSeeker) (string, error) {
 	evtStr := string(evtBytes)
 
 	return fmt.Sprintf("%v", evtStr), nil
-}
-
-// NextBatch is called by Falco plugin framework to get a batch of events from the instance
-func (dockerInstance *DockerInstance) NextBatch(pState sdk.PluginState, evts sdk.EventWriters) (int, error) {
-
-	dockerPlugin := pState.(*DockerPlugin)
-
-	i := 0
-	expire := time.After(time.Duration(dockerPlugin.FlushInterval) * time.Millisecond)
-	for i < evts.Len() {
-		select {
-		case m := <-dockerInstance.msgC:
-			s, _ := json.Marshal(m)
-			evt := evts.Get(i)
-			if _, err := evt.Writer().Write(s); err != nil {
-				return i, err
-			}
-			i++
-		case <-expire:
-			// Timeout occurred, flush a partial batch
-			return i, sdk.ErrTimeout
-		case err := <-dockerInstance.errC:
-			// todo: this will cause the program to exit. May we want to ignore some kind of error?
-			return i, err
-		}
-	}
-
-	// The batch is full
-	return i, nil
-}
-
-func (dockerInstance *DockerInstance) Close() {
-	dockerInstance.ctx.Done()
 }
 
 // main is mandatory but empty, because the plugin will be used as C library by Falco plugin framework
