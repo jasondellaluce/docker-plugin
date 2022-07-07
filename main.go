@@ -24,6 +24,7 @@ import (
 	"io/ioutil"
 	"time"
 
+	"github.com/alecthomas/jsonschema"
 	"github.com/falcosecurity/plugin-sdk-go/pkg/sdk"
 	"github.com/falcosecurity/plugin-sdk-go/pkg/sdk/plugins"
 	"github.com/falcosecurity/plugin-sdk-go/pkg/sdk/plugins/extractor"
@@ -43,13 +44,18 @@ const (
 	PluginEventSource        = "docker"
 )
 
+// DockerPlugin configs represents all parameters we can set with 'init_config'
+type DockerPluginConfig struct {
+	FlushInterval uint64 `json:"flushInterval" jsonschema:"description=Flush Interval in ms (Default: 30)"`
+}
+
 // DockerPlugin represents our plugin
 type DockerPlugin struct {
 	plugins.BasePlugin
-	FlushInterval uint64 `json:"flushInterval" jsonschema:"description=Flush Interval in ms (Default: 30)"`
-	ctx           context.Context
-	msgC          <-chan dockerEvents.Message
-	errC          <-chan error
+	config DockerPluginConfig
+	ctx    context.Context
+	msgC   <-chan dockerEvents.Message
+	errC   <-chan error
 }
 
 // DockerInstance represents a opened stream based on our Plugin
@@ -69,6 +75,11 @@ func init() {
 	})
 }
 
+// setDefault sets the default values of the config
+func (p *DockerPluginConfig) setDefault() {
+	p.FlushInterval = 30
+}
+
 // Info displays information of the plugin to Falco plugin framework
 func (dockerPlugin *DockerPlugin) Info() *plugins.Info {
 	return &plugins.Info{
@@ -85,8 +96,21 @@ func (dockerPlugin *DockerPlugin) Info() *plugins.Info {
 // we use it for setting default configuration values and mapping
 // values from `init_config` (json format for this plugin)
 func (dockerPlugin *DockerPlugin) Init(config string) error {
-	dockerPlugin.FlushInterval = 30
-	return json.Unmarshal([]byte(config), &dockerPlugin)
+	dockerPlugin.config.setDefault()
+	return json.Unmarshal([]byte(config), &dockerPlugin.config)
+}
+
+func (p *DockerPlugin) InitSchema() *sdk.SchemaInfo {
+	reflector := jsonschema.Reflector{
+		RequiredFromJSONSchemaTags: true, // all properties are optional by default
+		AllowAdditionalProperties:  true, // unrecognized properties don't cause a parsing failures
+	}
+	if schema, err := reflector.Reflect(&DockerPluginConfig{}).MarshalJSON(); err == nil {
+		return &sdk.SchemaInfo{
+			Schema: string(schema),
+		}
+	}
+	return nil
 }
 
 // Fields exposes to Falco plugin framework all availables fields for this plugin
@@ -183,8 +207,7 @@ func (dockerPlugin *DockerPlugin) Open(params string) (source.Instance, error) {
 	if err != nil {
 		return nil, err
 	}
-	ctx := context.Background()
-	dockerPlugin.msgC, dockerPlugin.errC = dclient.Events(ctx, dockerTypes.EventsOptions{})
+	dockerPlugin.msgC, dockerPlugin.errC = dclient.Events(dockerPlugin.ctx, dockerTypes.EventsOptions{})
 
 	pull := func(ctx context.Context, evt sdk.EventWriter) error {
 		select {
@@ -202,7 +225,7 @@ func (dockerPlugin *DockerPlugin) Open(params string) (source.Instance, error) {
 	return source.NewPullInstance(
 		pull,
 		source.WithInstanceClose(func() { dockerPlugin.ctx.Done() }),
-		source.WithInstanceTimeout(time.Duration(dockerPlugin.FlushInterval)*time.Millisecond),
+		source.WithInstanceTimeout(time.Duration(dockerPlugin.config.FlushInterval)*time.Millisecond),
 	)
 }
 
