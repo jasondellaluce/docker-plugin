@@ -168,11 +168,13 @@ func (Plugin *Plugin) Open(params string) (source.Instance, error) {
 	go func() {
 		defer close(eventC)
 		msgC, errC := dclient.Events(ctx, dockerTypes.EventsOptions{})
-		var msg dockerEvents.Message
-		var err error
 		for {
 			select {
-			case msg = <-msgC:
+			case msg, ok := <-msgC:
+				if !ok {
+					// channel is closed, so we can stop here
+					return
+				}
 				bytes, err := json.Marshal(msg)
 				if err != nil {
 					eventC <- source.PushEvent{Err: err}
@@ -180,7 +182,11 @@ func (Plugin *Plugin) Open(params string) (source.Instance, error) {
 					return
 				}
 				eventC <- source.PushEvent{Data: bytes}
-			case err = <-errC:
+			case err, ok := <-errC:
+				if !ok {
+					// channel is closed, so we can stop here
+					return
+				}
 				if err == io.EOF {
 					// map EOF to sdk.ErrEOF, which is recognized by the Go SDK
 					err = sdk.ErrEOF
